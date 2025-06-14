@@ -1,7 +1,7 @@
 
 # NexusGene
 
-This project is a pytorch geometric learning framework for pan-cancer gene identifications. It applies to both homogeneous networks (PPI network)and heterogeneous networks. TREE can provide generalizable robust and accurate cancer gene identifications with multi-omics-level and network structure-level interpretability.
+This project is a pytorch geometric learning framework for pan-cancer gene identifications. It applies to both homogeneous networks (PPI network)and heterogeneous networks. NexusGene can provide generalizable robust and accurate cancer gene identifications with multi-omics-level and network structure-level interpretability.
 
 
 ## Installation
