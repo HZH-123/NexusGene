@@ -11,7 +11,6 @@ def read_h5file(path, network_name='network', feature_name='features'):
         features = f[feature_name][:]
         y_train = f['y_train'][:]
         gene_names = f['gene_names'][:]
-        #print("features",f['features'][:])
         y_test = f['y_test'][:]
         if 'y_val' in f:
             y_val = f['y_val'][:]
@@ -44,7 +43,7 @@ def read_h5file(path, network_name='network', feature_name='features'):
         val_mask=val_mask,
         gene_names=gene_names
     )
-#data=read_h5file(r"/root/autodl-tmp/UNGSL/UNGSL_test/network/LTG_multiomics.h5")
+
 
 
 

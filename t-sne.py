@@ -1,7 +1,5 @@
 import numpy as np
 import torch
-from networkx import eigenvector_centrality
-
 from sklearn.metrics import (
     roc_auc_score, precision_recall_curve, auc,
     f1_score, precision_score, recall_score, accuracy_score
@@ -10,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss
 from torch_geometric.nn import GCNConv, SAGEConv, GATConv
-from torch_geometric.utils import to_dense_adj, dense_to_sparse, degree, coalesce
+from torch_geometric.utils import to_dense_adj, dense_to_sparse
 from UNGSL_test.cluster import create_cluster
 from UNGSL_test.data_h5_loader import read_h5file
 import pandas as pd
@@ -19,18 +17,10 @@ warnings.filterwarnings("ignore")
 
 torch.manual_seed(42)
 np.random.seed(42)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 # === 设备与数据加载 ===
 primary_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-data = read_h5file("networks/IREF_2015_multiomics.h5")
-from sklearn.preprocessing import StandardScaler
-scaler = StandardScaler()
-x_np = data.x.cpu().numpy()
-x_scaled = scaler.fit_transform(x_np)
-data.x = torch.tensor(x_scaled, dtype=torch.float)
+data = read_h5file("networks/LTG_multiomics.h5")
 data_full = data.to(primary_device)
 data_full.y = data_full.y.float()
 dataset = create_cluster(data.cpu())
@@ -42,7 +32,7 @@ for i, sub in enumerate(dataset):
 config = {
     'gsl_hidden': 256,
     'cls_hidden': 128,
-    'dropout': 0.1,
+    'dropout': 0.5,
     'threshold': 0.01,
     'alpha': 0.8,
     'reg_weight': 1e-5,
@@ -78,6 +68,7 @@ class EnhancedClassifier(nn.Module):
         self.conv3 = SAGEConv(hidden_channel, hidden_channel)
         self.dropout = config['dropout']
         self.conv4 = SAGEConv(hidden_channel, out_channel)
+        # 残差连接（可选但推荐）
         self.residual = nn.Linear(in_channel, hidden_channel) if in_channel != hidden_channel else None
 
     def forward(self, x, edge_index):
@@ -106,31 +97,40 @@ class UNGSLayer(nn.Module):
 class FullGraphGNN(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim=1):
         super().__init__()
+        # 第一层：GAT + SAGE，各输出 hidden_dim // 2
         self.gat = GATConv(
             in_channels=in_dim,
             out_channels=hidden_dim // 2,
-            heads=1,  # 减少头数以节省显存
-            concat=False,
+            heads=2,
+            concat=False,  # 输出维度 = hidden_dim // 2（平均多头）
             dropout=0.3,
-            add_self_loops=True
+            add_self_loops=True  # 默认添加自环（推荐）
         )
         self.sage = SAGEConv(in_dim, hidden_dim // 2)
+
         self.bn1 = nn.LayerNorm(hidden_dim)
+        # 第二层：SAGEConv（可继续使用 edge_weight）
         self.conv2 = SAGEConv(hidden_dim, hidden_dim)
         self.bn2 = nn.LayerNorm(hidden_dim)
+
         self.classifier = nn.Linear(hidden_dim, out_dim)
         self.dropout = nn.Dropout(0.5)
 
     def forward(self, x, edge_index, edge_weight=None):
-        x1 = self.gat(x, edge_index)
-        x2 = self.sage(x, edge_index, edge_weight)
-        x = torch.cat([x1, x2], dim=-1)
+        # GAT 分支（不使用 edge_weight，但可加自环）
+        x1 = self.gat(x, edge_index)  # [N, hidden_dim//2]
+        # SAGE 分支（支持 edge_weight）
+        x2 = self.sage(x, edge_index, edge_weight)  # [N, hidden_dim//2]
+
+        x = torch.cat([x1, x2], dim=-1)  # [N, hidden_dim]
         x = F.relu(self.bn1(x))
         x = self.dropout(x)
-        x = self.conv2(x, edge_index, edge_weight)
+
+        x = self.conv2(x, edge_index, edge_weight)  # [N, hidden_dim]
         x = F.relu(self.bn2(x))
         x = self.dropout(x)
-        x = self.classifier(x)
+
+        x = self.classifier(x)  # [N, out_dim]
         return x.squeeze(-1)
 
 class FocalLoss(nn.Module):
@@ -151,7 +151,7 @@ def compute_confidence(logits):
     confidence = 1.0 - entropy
     return confidence.clamp(0.0, 1.0)
 
-# === 子图训练函数（显存优化）===
+# === 子图训练函数（保持不变）===
 def train_model(subgraph):
     device = primary_device
     subgraph = subgraph.to(device)
@@ -190,7 +190,7 @@ def train_model(subgraph):
         edge_index_S = torch.nonzero(S > config['threshold']).t()
         logits = pretrain_cls(x, edge_index_S).squeeze(-1)
         cls_loss = criterion(logits, y)
-        loss = cls_loss + aff_loss
+        loss = cls_loss + aff_loss  # ✅ 合并损失
         loss.backward()
         torch.nn.utils.clip_grad_norm_(pretrain_gsl.parameters(), max_norm=2.0)
         torch.nn.utils.clip_grad_norm_(pretrain_cls.parameters(), max_norm=2.0)
@@ -204,8 +204,8 @@ def train_model(subgraph):
 
     model_cls.requires_grad_(False)
     finetune_optim = torch.optim.AdamW([
-        {'params': model_gsl.parameters(), 'lr': 1e-3},
-        {'params': model_ungsl.parameters(), 'lr': 5e-3}
+        {'params': model_gsl.parameters(), 'lr': 1e-2},
+        {'params': model_ungsl.parameters(), 'lr': 5e-2}
     ], weight_decay=1e-5)
 
     for epoch in range(1, 201):
@@ -233,11 +233,7 @@ def train_model(subgraph):
         total_loss.backward()
         finetune_optim.step()
 
-    # 显存释放
-    orig_idx = subgraph.orig_node_idx.clone()
-    del adj_dense, S, S_hat, edge_index_S, edge_index_finetune, subgraph
-    torch.cuda.empty_cache()
-    return model_gsl, model_cls, model_ungsl, orig_idx
+    return model_gsl, model_cls, model_ungsl, subgraph.orig_node_idx
 
 # === Step 1: 训练所有子图模型 ===
 models = []
@@ -245,10 +241,9 @@ for sub in dataset:
     print(f"Training subgraph {len(models)+1}/{len(dataset)}...")
     models.append(train_model(sub))
 
-# === Step 2: 结构集成（稀疏化！）===
+# === Step 2: 结构集成（保持不变）===
 N = data_full.num_nodes
-all_edges = []
-all_weights = []
+ensemble_adj = torch.zeros((N, N), device=primary_device)
 
 for i, (model_gsl, model_cls, model_ungsl, orig_idx) in enumerate(models):
     print(f"Processing subgraph {i+1}/{len(models)} for structure ensemble...")
@@ -271,44 +266,26 @@ for i, (model_gsl, model_cls, model_ungsl, orig_idx) in enumerate(models):
         confidence_sub = compute_confidence(cls_out_sub)
         S_hat_sub = model_ungsl(S_sub, confidence_sub)
 
+        # ✅ 改进：自适应 top-p 稀疏化（替代固定 topk）
         triu_mask = torch.triu(torch.ones_like(S_hat_sub), diagonal=1).bool()
         values = S_hat_sub[triu_mask]
         if values.numel() > 0:
-            k = max(5, int(config['top_p'] * values.numel()))
-            if k < values.numel():
-                threshold_val = torch.kthvalue(values, values.numel() - k + 1).values
-            else:
+            k = max(5, int(config['top_p'] * values.numel()))  # 至少保留5条
+            if k >= values.numel():
                 threshold_val = values.min()
+            else:
+                threshold_val = torch.kthvalue(values, values.numel() - k + 1).values
             mask = S_hat_sub >= threshold_val
-            mask = mask | mask.t()
+            mask = mask | mask.t()  # 对称化
         else:
             mask = torch.zeros_like(S_hat_sub, dtype=torch.bool)
 
         rows, cols = torch.nonzero(mask, as_tuple=True)
-        if rows.numel() > 0:
-            global_rows = sub_nodes[rows]
-            global_cols = sub_nodes[cols]
-            weights = S_hat_sub[rows, cols]
-            all_edges.append(torch.stack([global_rows, global_cols], dim=0))
-            all_weights.append(weights)
+        full_adj_i = torch.zeros_like(ensemble_adj)
+        full_adj_i[sub_nodes[rows], sub_nodes[cols]] = S_hat_sub[rows, cols]
+        ensemble_adj += full_adj_i
 
-    # 显存清理
-    del S_sub, S_hat_sub, mask, adj_sub, x_sub, subgraph
-    torch.cuda.empty_cache()
-
-# 合并所有边（去重 + 权重聚合）
-if all_edges:
-    edge_index_ensemble = torch.cat(all_edges, dim=1)
-    edge_weight_ensemble = torch.cat(all_weights, dim=0)
-    # 去重：保留最大权重
-    edge_index_ensemble, inverse = torch.unique(edge_index_ensemble, dim=1, return_inverse=True)
-    final_weights = torch.zeros(edge_index_ensemble.size(1), device=primary_device)
-    final_weights.scatter_reduce_(0, inverse, edge_weight_ensemble, reduce="max", include_self=False)
-else:
-    edge_index_ensemble = torch.empty((2, 0), dtype=torch.long, device=primary_device)
-    final_weights = torch.empty(0, device=primary_device)
-
-print(f"✅ Ensemble graph has {edge_index_ensemble.size(1)} edges.")
+#ensemble_adj = ensemble_adj / len(models)
 
 # === Step 3: 自动调融合权重 λ 并评估 ===
 orig_adj_dense = to_dense_adj(data_full.edge_index.to(primary_device), max_num_nodes=N)[0]
@@ -318,7 +295,7 @@ def train_and_evaluate(edge_index, edge_weight, x_full, y_full,
                        pos_weight, device, model_save_path,
                        epochs=500, lr=0.01, weight_decay=5e-4,
                        max_patience=30):
-    model = FullGraphGNN(in_dim=x_full.size(1), hidden_dim=64).to(device)  # 降低 hidden_dim
+    model = FullGraphGNN(in_dim=x_full.size(1), hidden_dim=128).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
@@ -358,27 +335,38 @@ def train_and_evaluate(edge_index, edge_weight, x_full, y_full,
         if patience >= max_patience:
             break
 
-    model.load_state_dict(torch.load(model_save_path, map_location=device))
+    # 加载最佳模型
+    model.load_state_dict(torch.load(model_save_path))
 
+    # 验证集选阈值
     model.eval()
     with torch.no_grad():
         val_out = model(x_full, edge_index, edge_weight)
         val_probs = torch.sigmoid(val_out[val_mask]).cpu().numpy()
         val_labels = y_full[val_mask].cpu().numpy()
 
+        # 替换原来的 F1 阈值搜索
+        best_aupr_metric = 0.0
         best_thr = 0.5
+
         if val_labels.sum() > 0:
             precision, recall, thresholds = precision_recall_curve(val_labels, val_probs)
-            best_metric = 0.0
+            # 计算每个阈值对应的 F1 和 AUPR 局部指标
             for i, thr in enumerate(thresholds):
+                # 只考虑 Recall >= 0.6 的区域（AUPR 敏感区）
                 if recall[i] >= 0.60:
                     f1_local = 2 * (precision[i] * recall[i]) / (precision[i] + recall[i] + 1e-8)
-                    if f1_local > best_metric:
-                        best_metric = f1_local
+                    # 用 F1 作为代理，但限制在高 Recall 区
+                    if f1_local > best_aupr_metric:
+                        best_aupr_metric = f1_local
                         best_thr = thr
-            if best_metric == 0.0:
+            # 如果没找到，回退到 0.5
+            if best_aupr_metric == 0.0:
                 best_thr = 0.5
+        else:
+            best_thr = 0.5
 
+        # 测试
         test_out = model(x_full, edge_index, edge_weight)
         test_probs = torch.sigmoid(test_out[test_mask]).cpu().numpy()
         test_labels = y_full[test_mask].cpu().numpy()
@@ -402,7 +390,6 @@ def train_and_evaluate(edge_index, edge_weight, x_full, y_full,
         'rec': rec,
         'best_thr': best_thr
     }
-
 results = []
 
 x_full = data_full.x.to(primary_device)
@@ -411,114 +398,23 @@ train_mask = data_full.train_mask
 val_mask = data_full.val_mask
 test_mask = data_full.test_mask
 
+# 计算 pos_weight（用于 BCEWithLogitsLoss）
 train_labels = y_full[train_mask]
 pos_weight = (1 - train_labels.mean()) / train_labels.mean()
-def train_and_evaluate_a(
-    edge_index_train,        # 训练阶段使用的边
-    edge_index_infer,        # 验证/测试阶段使用的边
-    x_full, y_full,
-    train_mask, val_mask, test_mask,
-    pos_weight, device, model_save_path,
-    epochs=500, lr=0.01, weight_decay=5e-4,
-    max_patience=30
-):
-    model = FullGraphGNN(in_dim=x_full.size(1), hidden_dim=64).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
 
-    best_val_aupr = 0.0
-    patience = 0
 
-    for epoch in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-        # 🟢 训练时只用 edge_index_train
-        out = model(x_full, edge_index_train)
-        loss = criterion(out[train_mask], y_full[train_mask])
-        loss.backward()
-        optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            # 🟢 推理时用 edge_index_infer
-            val_out = model(x_full, edge_index_infer)
-            val_probs = torch.sigmoid(val_out[val_mask]).cpu().numpy()
-            val_labels = y_full[val_mask].cpu().numpy()
-
-            if val_labels.sum() == 0:
-                val_aupr = 0.0
-            else:
-                precision, recall, _ = precision_recall_curve(val_labels, val_probs)
-                val_aupr = auc(recall, precision)
-
-        scheduler.step(val_aupr)
-
-        if val_aupr > best_val_aupr:
-            best_val_aupr = val_aupr
-            patience = 0
-            torch.save(model.state_dict(), model_save_path)
-        else:
-            patience += 1
-
-        if patience >= max_patience:
-            break
-
-    model.load_state_dict(torch.load(model_save_path, map_location=device))
-
-    model.eval()
-    with torch.no_grad():
-        # 🟢 测试也用 edge_index_infer
-        test_out = model(x_full, edge_index_infer)
-        test_probs = torch.sigmoid(test_out[test_mask]).cpu().numpy()
-        test_labels = y_full[test_mask].cpu().numpy()
-
-        # 阈值选择（同前）
-        val_out = model(x_full, edge_index_infer)
-        val_probs = torch.sigmoid(val_out[val_mask]).cpu().numpy()
-        val_labels = y_full[val_mask].cpu().numpy()
-
-        best_thr = 0.5
-        if val_labels.sum() > 0:
-            precision, recall, thresholds = precision_recall_curve(val_labels, val_probs)
-            best_metric = 0.0
-            for i, thr in enumerate(thresholds):
-                if recall[i] >= 0.60:
-                    f1_local = 2 * (precision[i] * recall[i]) / (precision[i] + recall[i] + 1e-8)
-                    if f1_local > best_metric:
-                        best_metric = f1_local
-                        best_thr = thr
-            if best_metric == 0.0:
-                best_thr = 0.5
-
-        pred_test = (test_probs > best_thr).astype(int)
-        acc = accuracy_score(test_labels, pred_test)
-        auc_score = roc_auc_score(test_labels, test_probs) if len(np.unique(test_labels)) > 1 else 0.5
-        precision, recall, _ = precision_recall_curve(test_labels, test_probs)
-        aupr_score = auc(recall, precision)
-        f1 = f1_score(test_labels, pred_test)
-        prec = precision_score(test_labels, pred_test)
-        rec = recall_score(test_labels, pred_test)
-
-    return {
-        'val_aupr': best_val_aupr,
-        'acc': acc,
-        'auc': auc_score,
-        'aupr': aupr_score,
-        'f1': f1,
-        'prec': prec,
-        'rec': rec,
-        'best_thr': best_thr
-    }
+results = []
 
 # =============== 实验 1：原始图（baseline） ===============
 print("\n" + "="*50)
 print("🧪 Experiment 1: Original Graph (Baseline)")
 print("="*50)
 
-edge_index_orig, _ = dense_to_sparse(orig_adj_dense)
+edge_index_orig, edge_weight_orig = dense_to_sparse(orig_adj_dense)
 edge_index_orig = edge_index_orig.to(primary_device)
+edge_weight_orig = edge_weight_orig.to(primary_device)
 
+# 训练函数（后面定义）
 metrics_orig = train_and_evaluate(
     edge_index_orig, None,
     x_full, y_full, train_mask, val_mask, test_mask,
@@ -526,159 +422,132 @@ metrics_orig = train_and_evaluate(
     model_save_path='best_model_orig.pth'
 )
 
+results.append({
+    'Method': 'Original Graph',
+    'Val_Best_AUPR': metrics_orig['val_aupr'],
+    'Test_Acc': metrics_orig['acc'],
+    'Test_AUC': metrics_orig['auc'],
+    'Test_AUPR': metrics_orig['aupr'],
+    'Test_F1': metrics_orig['f1'],
+    'Test_Precision': metrics_orig['prec'],
+    'Test_Recall': metrics_orig['rec'],
+    'Best_Threshold': metrics_orig['best_thr']
+})
 
 print(f"✅ Original Graph | Test AUPR: {metrics_orig['aupr']:.4f} | F1: {metrics_orig['f1']:.4f}")
 
 # =============== 实验 2：精炼图（Refined Graph） ===============
-print("\n" + "=" * 50)
-print("🧪 Experiment 2: Refined Graph (Allow test nodes in inference only)")
-print("=" * 50)
-
-# 原始边（用于去重）
-orig_edge_set = set(map(tuple, edge_index_orig.t().cpu().numpy()))
-train_nodes = set(torch.where(train_mask)[0].cpu().tolist())
-orig_edge_count = edge_index_orig.size(1)
-
-# 收集所有候选新边（不限于训练节点）
-candidate_edges = []
-candidate_weights = []
-
-for i in range(edge_index_ensemble.size(1)):
-    u, v = edge_index_ensemble[:, i].cpu().tolist()
-    w = final_weights[i].item()
-
-    # 跳过已存在的边
-    if (u, v) in orig_edge_set or (v, u) in orig_edge_set:
-        continue
-
-    # 更严格的相似度阈值（可调）
-    if w <= 0.5:
-        continue
-
-    candidate_edges.append([u, v])
-    candidate_weights.append(w)
-
-# 如果没有候选边，直接使用原始图
-if not candidate_edges:
-    edge_index_train = edge_index_orig
-    edge_index_full_refined = edge_index_orig
-else:
-    # 构建候选边张量：确保是 (2, M)
-    candidate_edge_index = torch.tensor(candidate_edges, dtype=torch.long).t().contiguous().to(primary_device)
-    candidate_edge_weight = torch.tensor(candidate_weights, dtype=torch.float).to(primary_device)
-
-    # --- 1. 构建训练用边：仅保留两端都在训练集的新边 ---
-    u_list = candidate_edge_index[0].cpu().tolist()
-    v_list = candidate_edge_index[1].cpu().tolist()
-    u_train_mask = torch.tensor([u in train_nodes for u in u_list], device=primary_device)
-    v_train_mask = torch.tensor([v in train_nodes for v in v_list], device=primary_device)
-    train_edge_mask = u_train_mask & v_train_mask
-
-    train_new_edges = candidate_edge_index[:, train_edge_mask]  # shape: (2, K)
-
-    # 可选：限制训练新增边数量（如不超过原始边的5%）
-    max_train_new = int(orig_edge_count * 0.05)
-    if train_new_edges.size(1) > max_train_new:
-        train_weights = candidate_edge_weight[train_edge_mask]
-        topk = torch.topk(train_weights, max_train_new)
-        train_new_edges = train_new_edges[:, topk.indices]
-
-    # 打印调试信息
-    print(f"Original edges shape: {edge_index_orig.shape}")
-    print(f"New training edges shape: {train_new_edges.shape}")
-
-    # 拼接原始边和新边（确保都是 (2, *)）
-    assert edge_index_orig.dim() == 2 and edge_index_orig.size(
-        0) == 2, f"edge_index_orig shape invalid: {edge_index_orig.shape}"
-    assert train_new_edges.dim() == 2 and train_new_edges.size(
-        0) == 2, f"train_new_edges shape invalid: {train_new_edges.shape}"
-
-    edge_index_train = torch.cat([edge_index_orig, train_new_edges], dim=1)  # (2, E1 + K)
-
-    # 强制 coalesce 并检查结果
-    edge_index_train, _ = coalesce(edge_index_train,None, num_nodes=N)
-    print("coalesce function:", coalesce)
-    if edge_index_train.dim() != 2 or edge_index_train.size(0) != 2:
-        raise RuntimeError(f"Unexpected shape after coalesce: {edge_index_train.shape}")
-    if edge_index_train.numel() % 2 != 0:
-        raise RuntimeError(f"coalesce returned odd-length tensor: {edge_index_train.numel()}")
-
-    # --- 2. 构建完整精炼图（用于推理）---
-    max_total_new = int(orig_edge_count * 0.2)  # 最多新增20%
-    if candidate_edge_index.size(1) > max_total_new:
-        topk_total = torch.topk(candidate_edge_weight, max_total_new)
-        candidate_edge_index = candidate_edge_index[:, topk_total.indices]
-
-    edge_index_full_refined = torch.cat([edge_index_orig, candidate_edge_index], dim=1)
-    edge_index_full_refined, _ = coalesce(edge_index_full_refined,None, num_nodes=N)
-    if edge_index_full_refined.dim() != 2 or edge_index_full_refined.size(0) != 2:
-        raise RuntimeError(f"Unexpected shape after coalesce for full refined: {edge_index_full_refined.shape}")
-    if edge_index_full_refined.numel() % 2 != 0:
-        raise RuntimeError(f"coalesce returned odd-length tensor for full refined: {edge_index_full_refined.numel()}")
-
-# 确保最终输出的形状正确
-assert edge_index_train.dim() == 2 and edge_index_train.size(
-    0) == 2, f"Final edge_index_train shape invalid: {edge_index_train.shape}"
-assert edge_index_full_refined.dim() == 2 and edge_index_full_refined.size(
-    0) == 2, f"Final edge_index_full_refined shape invalid: {edge_index_full_refined.shape}"
-
-print(f"✅ Training graph edges: {edge_index_train.size(1)} "
-      f"(added: {edge_index_train.size(1) - edge_index_orig.size(1)})")
-print(f"✅ Full refined graph edges: {edge_index_full_refined.size(1)} "
-      f"(added: {edge_index_full_refined.size(1) - edge_index_orig.size(1)})")
-
-# 评估 refined graph
-metrics_refined = train_and_evaluate_a(
-    edge_index_train=edge_index_train,
-    edge_index_infer=edge_index_full_refined,
-    x_full=x_full, y_full=y_full,
-    train_mask=train_mask, val_mask=val_mask, test_mask=test_mask,
-    pos_weight=pos_weight, device=primary_device,
-    model_save_path='best_model_refined.pth'
-)
-
-print(f"✅ Refined Graph | Test AUPR: {metrics_refined['aupr']:.4f} | F1: {metrics_refined['f1']:.4f}")
-
-# =============== 实验 3：Ensemble Prediction ===============
 print("\n" + "="*50)
-print("🧪 Experiment 3: Ensemble Prediction")
+print("🧪 Experiment 2: Refined Graph (Original + Top New Edges from Ensemble)")
 print("="*50)
 
-model_orig = FullGraphGNN(in_dim=x_full.size(1), hidden_dim=64).to(primary_device)
+# 先用原始图训练一个快速分类器，获取全图置信度
+quick_model = FullGraphGNN(in_dim=x_full.size(1), hidden_dim=128).to(primary_device)
+quick_opt = torch.optim.Adam(quick_model.parameters(), lr=0.01, weight_decay=5e-4)
+quick_criterion = FocalLoss()
+
+for _ in range(100):  # 快速训练
+    quick_model.train()
+    quick_opt.zero_grad()
+    out = quick_model(x_full, edge_index_orig)
+    loss = quick_criterion(out[train_mask], y_full[train_mask])
+    loss.backward()
+    quick_opt.step()
+
+quick_model.eval()
+with torch.no_grad():
+    quick_logits = quick_model(x_full, edge_index_orig)
+    quick_pred = torch.sigmoid(quick_logits) > 0.5  # 二值预测
+    same_label_mask = quick_pred.unsqueeze(0) == quick_pred.unsqueeze(1)  # 同预测标签
+
+# 图精炼
+fused_adj = orig_adj_dense.clone()
+candidate_mask = orig_adj_dense < 0.01  # 放宽阈值
+# 只保留：集成图中强边 + 同预测标签
+#valid_new = (ensemble_adj > 0.1) & candidate_mask & same_label_mask.to(primary_device)
+valid_new = (ensemble_adj > 0.23) & candidate_mask
+
+num_new = int(valid_new.sum().item())
+if num_new > 8000:
+    scores = ensemble_adj * valid_new.float()
+    threshold = torch.kthvalue(scores.view(-1), scores.numel() - 8000).values
+    final_mask = (scores >= threshold) & valid_new
+else:
+    final_mask = valid_new
+
+fused_adj = orig_adj_dense.clone()
+fused_adj[final_mask] = ensemble_adj[final_mask]
+print(f"✅ Added {final_mask.sum().item()} high-quality semantic-consistent edges.")
+
+# 转稀疏（忽略 edge_weight，因 SAGE 不用）
+edge_index_refined, edge_weight_refined = dense_to_sparse(fused_adj)
+edge_index_refined = edge_index_refined.to(primary_device)
+edge_weight_refined = edge_weight_refined.to(primary_device)  # 虽然不用，但定义它
+# 训练评估
+metrics_refined = train_and_evaluate(
+    edge_index_refined, None,
+    x_full, y_full, train_mask, val_mask, test_mask,
+    pos_weight, primary_device,
+    model_save_path='best_model_refined.pth'
+)
+results.append({
+    'Method': 'Refined Graph',
+    'Val_Best_AUPR': metrics_refined['val_aupr'],
+    'Test_Acc': metrics_refined['acc'],
+    'Test_AUC': metrics_refined['auc'],
+    'Test_AUPR': metrics_refined['aupr'],
+    'Test_F1': metrics_refined['f1'],
+    'Test_Precision': metrics_refined['prec'],
+    'Test_Recall': metrics_refined['rec'],
+    'Best_Threshold': metrics_refined['best_thr']
+})
+
+print(f"✅ Refined Graph | Test AUPR: {metrics_refined['aupr']:.4f} | F1: {metrics_refined['f1']:.4f}")
+# =============== 实验 3：Ensemble Prediction (Original + Refined) ===============
+print("\n" + "="*50)
+print("🧪 Experiment 3: Ensemble Prediction (Original + Refined Models)")
+print("="*50)
+
+# 加载两个训练好的模型
+model_orig = FullGraphGNN(in_dim=x_full.size(1), hidden_dim=128).to(primary_device)
 model_orig.load_state_dict(torch.load('best_model_orig.pth', map_location=primary_device))
 model_orig.eval()
 
-model_refined = FullGraphGNN(in_dim=x_full.size(1), hidden_dim=64).to(primary_device)
+model_refined = FullGraphGNN(in_dim=x_full.size(1), hidden_dim=128).to(primary_device)
 model_refined.load_state_dict(torch.load('best_model_refined.pth', map_location=primary_device))
 model_refined.eval()
 
+# 获取验证集 logits 用于选阈值
 with torch.no_grad():
     val_out_orig = model_orig(x_full, edge_index_orig)[val_mask]
-    val_out_refined = model_refined(x_full, edge_index_full_refined)[val_mask]
+    val_out_refined = model_refined(x_full, edge_index_refined)[val_mask]
     val_ensemble_logits = (val_out_orig + val_out_refined) / 2.0
     val_probs_ens = torch.sigmoid(val_ensemble_logits).cpu().numpy()
     val_labels_np = y_full[val_mask].cpu().numpy()
 
+# 在验证集上选择 AUPR 友好阈值（Recall >= 0.6）
 best_ens_thr = 0.5
 if val_labels_np.sum() > 0:
     precision, recall, thresholds = precision_recall_curve(val_labels_np, val_probs_ens)
     best_metric = 0.0
     for i, thr in enumerate(thresholds):
-        if recall[i] >= 0.60:
+        if recall[i] >= 0.60:  # 关注高 Recall 区域
             f1_local = 2 * (precision[i] * recall[i]) / (precision[i] + recall[i] + 1e-8)
             if f1_local > best_metric:
                 best_metric = f1_local
                 best_ens_thr = thr
-    if best_metric == 0.0:
+    if best_metric == 0.0:  # 回退
         best_ens_thr = 0.5
 
+# 测试集预测
 with torch.no_grad():
     test_out_orig = model_orig(x_full, edge_index_orig)[test_mask]
-    test_out_refined = model_refined(x_full, edge_index_full_refined)[test_mask]
+    test_out_refined = model_refined(x_full, edge_index_refined)[test_mask]
     test_ensemble_logits = (test_out_orig + test_out_refined) / 2.0
     test_probs_ens = torch.sigmoid(test_ensemble_logits).cpu().numpy()
     test_labels_np = y_full[test_mask].cpu().numpy()
 
+# 评估
 pred_ens = (test_probs_ens > best_ens_thr).astype(int)
 acc = accuracy_score(test_labels_np, pred_ens)
 auc_score = roc_auc_score(test_labels_np, test_probs_ens) if len(np.unique(test_labels_np)) > 1 else 0.5
@@ -688,9 +557,10 @@ f1 = f1_score(test_labels_np, pred_ens)
 prec = precision_score(test_labels_np, pred_ens)
 rec = recall_score(test_labels_np, pred_ens)
 
+# 保存结果
 results.append({
     'Method': 'Ensemble (Orig+Refined)',
-    'Val_Best_AUPR': 0.0,
+    'Val_Best_AUPR': 0.0,  # 未单独训练，无法准确获取
     'Test_Acc': acc,
     'Test_AUC': auc_score,
     'Test_AUPR': aupr_score,
@@ -700,9 +570,9 @@ results.append({
     'Best_Threshold': best_ens_thr
 })
 
-print(f"✅ Ensemble Prediction | Test AUPR: {aupr_score:.4f} | F1: {f1:.4f}")
+print(f"✅ Ensemble Prediction | Test AUPR: {aupr_score:.4f} | F1: {f1:.4f} | Recall: {rec:.4f}")
 
-# =============== 打印结果 ===============
+# =============== 打印最终结果 ===============
 print("\n" + "="*80)
 print("📊 FINAL COMPARISON")
 print("="*80)
@@ -712,8 +582,77 @@ print(df.to_string(index=False, float_format="%.4f"))
 best_row = df.loc[df['Test_AUPR'].idxmax()]
 print(f"\n🏆 Best Method: {best_row['Method']}, Test AUPR = {best_row['Test_AUPR']:.4f}")
 
-df_sorted = df.sort_values('Test_AUPR', ascending=False)
+# 可选：排序后打印
 print("\n" + "="*80)
 print("📊 FINAL RESULTS (sorted by Test AUPR)")
 print("="*80)
+df_sorted = df.sort_values('Test_AUPR', ascending=False)
 print(df_sorted.to_string(index=False, float_format="%.4f"))
+
+# ==============================
+# 🧪 t-SNE Visualization
+# ==============================
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+
+def extract_embeddings(model, x, edge_index, device):
+    """提取模型最后一层之前的节点嵌入（即分类前的 hidden 表示）"""
+    model.eval()
+    with torch.no_grad():
+        # GAT 分支
+        x1 = model.gat(x, edge_index)  # [N, hidden_dim//2]
+        # SAGE 分支
+        x2 = model.sage(x, edge_index)  # [N, hidden_dim//2]
+        x = torch.cat([x1, x2], dim=-1)  # [N, hidden_dim]
+        x = F.relu(model.bn1(x))
+        x = model.dropout(x)
+        x = model.conv2(x, edge_index)  # [N, hidden_dim]
+        x = F.relu(model.bn2(x))
+        return x.cpu().numpy()
+
+print("\n" + "="*50)
+print("🎨 t-SNE Visualization of Refined Graph Embeddings")
+print("="*50)
+
+# 使用 refined 模型提取嵌入
+embeddings = extract_embeddings(model_refined, x_full, edge_index_refined, primary_device)
+
+# 仅可视化测试集节点（避免数据泄露）
+test_mask_tensor = test_mask if isinstance(test_mask, torch.Tensor) else torch.tensor(test_mask)
+test_indices = torch.where(test_mask_tensor)[0].cpu().numpy()
+test_embeddings = embeddings[test_indices]
+test_labels = y_full[test_mask].cpu().numpy()
+
+# t-SNE 降维
+print("Running t-SNE...")
+tsne = TSNE(n_components=2, perplexity=30, max_iter=1000, random_state=42, init='pca')
+embeddings_2d = tsne.fit_transform(test_embeddings)
+
+# 绘图：分别绘制两类
+plt.figure(figsize=(8, 6))
+
+# 分离两类索引
+idx_pan_cancer = test_labels == 1
+idx_non_pan_cancer = test_labels == 0
+
+plt.scatter(
+    embeddings_2d[idx_pan_cancer, 0],
+    embeddings_2d[idx_pan_cancer, 1],
+    c='red', s=15, alpha=0.8, label='Cancer Gene'
+)
+
+plt.scatter(
+    embeddings_2d[idx_non_pan_cancer, 0],
+    embeddings_2d[idx_non_pan_cancer, 1],
+    c='blue', s=15, alpha=0.8, label='Non-cancer Gene'
+)
+
+plt.legend(title="类别", fontsize=12, title_fontsize=12)
+plt.title('t-SNE of Node Embeddings (Refined Graph) - Test Set', fontsize=14)
+plt.xlabel('t-SNE Dimension 1')
+plt.ylabel('t-SNE Dimension 2')
+plt.tight_layout()
+plt.savefig('tsne_refined_graph.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+print("✅ t-SNE plot saved as 'tsne_refined_graph.png'")
