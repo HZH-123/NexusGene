@@ -6,6 +6,8 @@ from sklearn.metrics import (
     roc_auc_score, precision_recall_curve, auc,
     f1_score, precision_score, recall_score, accuracy_score
 )
+import time
+total_start_time = time.time()
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss
@@ -25,7 +27,7 @@ torch.backends.cudnn.benchmark = False
 # === 设备与数据加载 ===
 primary_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-data = read_h5file("networks/IREF_2015_multiomics.h5")
+data = read_h5file("networks/CPDB_multiomics.h5")
 from sklearn.preprocessing import StandardScaler
 scaler = StandardScaler()
 x_np = data.x.cpu().numpy()
@@ -42,11 +44,8 @@ for i, sub in enumerate(dataset):
 config = {
     'gsl_hidden': 256,
     'cls_hidden': 128,
-    'dropout': 0.1,
-    'threshold': 0.01,
+    'dropout': 0.2,
     'alpha': 0.8,
-    'reg_weight': 1e-5,
-    'topk': 10,
     'top_p': 0.1,
     'aff_weight': 0.1,
 }
@@ -166,7 +165,7 @@ def train_model(subgraph):
     pretrain_cls = EnhancedClassifier(subgraph.num_features, config['cls_hidden'], 1).to(device)
     pretrain_optim = torch.optim.AdamW([
         {'params': pretrain_gsl.parameters(), 'lr': 1e-3, 'weight_decay': 1e-3},
-        {'params': pretrain_cls.parameters(), 'lr': 1e-3, 'weight_decay': 1e-4}
+        {'params': pretrain_cls.parameters(), 'lr': 1e-2, 'weight_decay': 1e-4}
     ])
     criterion = nn.BCEWithLogitsLoss()
 
@@ -181,13 +180,32 @@ def train_model(subgraph):
             loss += F.relu(S[neg_mask] - margin).mean()
         return loss
 
+    def get_edge_index_from_S(S, top_p, min_edges=5):
+        """根据 S 和 top_p 动态生成 edge_index，对称化"""
+        n = S.size(0)
+        triu_mask = torch.triu(torch.ones_like(S), diagonal=1).bool()
+        values = S[triu_mask]
+        if values.numel() == 0:
+            return torch.empty((2, 0), dtype=torch.long, device=S.device)
+        k = max(min_edges, int(top_p * values.numel()))
+        k = min(k, values.numel())
+        if k < values.numel():
+            threshold_val = torch.kthvalue(values, values.numel() - k + 1).values
+        else:
+            threshold_val = values.min()
+        mask = S >= threshold_val
+        mask = mask | mask.t()  # 对称化
+        rows, cols = torch.nonzero(mask, as_tuple=True)
+        return torch.stack([rows, cols], dim=0)
+
+    # ========== Pretraining Stage ==========
     for epoch in range(1, 151):
         pretrain_gsl.train()
         pretrain_cls.train()
         pretrain_optim.zero_grad()
         S = pretrain_gsl(x, adj_dense)
         aff_loss = config['aff_weight'] * affinity_loss(S, y)
-        edge_index_S = torch.nonzero(S > config['threshold']).t()
+        edge_index_S = get_edge_index_from_S(S, config['top_p'])
         logits = pretrain_cls(x, edge_index_S).squeeze(-1)
         cls_loss = criterion(logits, y)
         loss = cls_loss + aff_loss
@@ -196,6 +214,7 @@ def train_model(subgraph):
         torch.nn.utils.clip_grad_norm_(pretrain_cls.parameters(), max_norm=2.0)
         pretrain_optim.step()
 
+    # ========== Finetuning Stage ==========
     model_gsl = EnhancedGSL(subgraph.num_features, config['gsl_hidden']).to(device)
     model_cls = EnhancedClassifier(subgraph.num_features, config['cls_hidden'], 1).to(device)
     model_ungsl = UNGSLayer(n).to(device)
@@ -204,38 +223,31 @@ def train_model(subgraph):
 
     model_cls.requires_grad_(False)
     finetune_optim = torch.optim.AdamW([
-        {'params': model_gsl.parameters(), 'lr': 1e-3},
-        {'params': model_ungsl.parameters(), 'lr': 5e-3}
+        {'params': model_gsl.parameters(), 'lr': 1e-4},
+        {'params': model_ungsl.parameters(), 'lr': 5e-4},
+        {'params': model_cls.parameters(), 'lr': 1e-3, 'weight_decay': 1e-4}
     ], weight_decay=1e-5)
 
     for epoch in range(1, 201):
         model_gsl.train()
         model_ungsl.train()
-        if epoch == 100:
-            model_cls.requires_grad_(True)
-            finetune_optim = torch.optim.AdamW([
-                {'params': model_gsl.parameters(), 'lr': 1e-4},
-                {'params': model_ungsl.parameters(), 'lr': 5e-4},
-                {'params': model_cls.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4}
-            ], weight_decay=1e-5)
+        model_cls.requires_grad_(True)
         finetune_optim.zero_grad()
         S = model_gsl(x, adj_dense)
         with torch.no_grad():
             cls_out = model_cls(x, edge_index)
             confidence = compute_confidence(cls_out)
         S_hat = model_ungsl(S, confidence)
-        edge_index_finetune = torch.nonzero(S_hat > config['threshold']).t()
+        edge_index_finetune = get_edge_index_from_S(S_hat, config['top_p'])
         out = model_cls(x, edge_index_finetune).squeeze(-1)
         cls_loss = criterion(out, y)
-        reg_loss = torch.norm(S_hat, p=1)
-        reg_weight = config['reg_weight'] * (1 + epoch / 500)
-        total_loss = cls_loss + reg_weight * reg_loss
+        total_loss = cls_loss
         total_loss.backward()
         finetune_optim.step()
 
     # 显存释放
     orig_idx = subgraph.orig_node_idx.clone()
-    del adj_dense, S, S_hat, edge_index_S, edge_index_finetune, subgraph
+    del adj_dense, S, S_hat, edge_index, subgraph
     torch.cuda.empty_cache()
     return model_gsl, model_cls, model_ungsl, orig_idx
 
@@ -637,6 +649,7 @@ metrics_refined = train_and_evaluate_a(
     model_save_path='best_model_refined.pth'
 )
 
+
 print(f"✅ Refined Graph | Test AUPR: {metrics_refined['aupr']:.4f} | F1: {metrics_refined['f1']:.4f}")
 
 # =============== 实验 3：Ensemble Prediction ===============
@@ -717,3 +730,5 @@ print("\n" + "="*80)
 print("📊 FINAL RESULTS (sorted by Test AUPR)")
 print("="*80)
 print(df_sorted.to_string(index=False, float_format="%.4f"))
+total_time = time.time() - total_start_time
+print(f"\n⏱️  Total running time: {total_time:.2f} seconds ({total_time / 60:.2f} minutes)")

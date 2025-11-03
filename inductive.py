@@ -46,8 +46,6 @@ config = {
     'dropout': 0.1,
     'threshold': 0.01,
     'alpha': 0.8,
-    'reg_weight': 1e-5,
-    'topk': 5,
     'top_p': 0.1,
     'aff_weight': 0.1,
 }
@@ -167,7 +165,7 @@ def train_model(subgraph):
     pretrain_cls = EnhancedClassifier(subgraph.num_features, config['cls_hidden'], 1).to(device)
     pretrain_optim = torch.optim.AdamW([
         {'params': pretrain_gsl.parameters(), 'lr': 1e-3, 'weight_decay': 1e-3},
-        {'params': pretrain_cls.parameters(), 'lr': 1e-3, 'weight_decay': 1e-4}
+        {'params': pretrain_cls.parameters(), 'lr': 1e-2, 'weight_decay': 1e-4}
     ])
     criterion = nn.BCEWithLogitsLoss()
 
@@ -182,13 +180,32 @@ def train_model(subgraph):
             loss += F.relu(S[neg_mask] - margin).mean()
         return loss
 
+    def get_edge_index_from_S(S, top_p, min_edges=5):
+        """根据 S 和 top_p 动态生成 edge_index，对称化"""
+        n = S.size(0)
+        triu_mask = torch.triu(torch.ones_like(S), diagonal=1).bool()
+        values = S[triu_mask]
+        if values.numel() == 0:
+            return torch.empty((2, 0), dtype=torch.long, device=S.device)
+        k = max(min_edges, int(top_p * values.numel()))
+        k = min(k, values.numel())
+        if k < values.numel():
+            threshold_val = torch.kthvalue(values, values.numel() - k + 1).values
+        else:
+            threshold_val = values.min()
+        mask = S >= threshold_val
+        mask = mask | mask.t()  # 对称化
+        rows, cols = torch.nonzero(mask, as_tuple=True)
+        return torch.stack([rows, cols], dim=0)
+
+    # ========== Pretraining Stage ==========
     for epoch in range(1, 151):
         pretrain_gsl.train()
         pretrain_cls.train()
         pretrain_optim.zero_grad()
         S = pretrain_gsl(x, adj_dense)
         aff_loss = config['aff_weight'] * affinity_loss(S, y)
-        edge_index_S = torch.nonzero(S > config['threshold']).t()
+        edge_index_S = get_edge_index_from_S(S, config['top_p'])
         logits = pretrain_cls(x, edge_index_S).squeeze(-1)
         cls_loss = criterion(logits, y)
         loss = cls_loss + aff_loss
@@ -197,6 +214,7 @@ def train_model(subgraph):
         torch.nn.utils.clip_grad_norm_(pretrain_cls.parameters(), max_norm=2.0)
         pretrain_optim.step()
 
+    # ========== Finetuning Stage ==========
     model_gsl = EnhancedGSL(subgraph.num_features, config['gsl_hidden']).to(device)
     model_cls = EnhancedClassifier(subgraph.num_features, config['cls_hidden'], 1).to(device)
     model_ungsl = UNGSLayer(n).to(device)
@@ -205,37 +223,31 @@ def train_model(subgraph):
 
     model_cls.requires_grad_(False)
     finetune_optim = torch.optim.AdamW([
-        {'params': model_gsl.parameters(), 'lr': 1e-3},
-        {'params': model_ungsl.parameters(), 'lr': 5e-3}
+        {'params': model_gsl.parameters(), 'lr': 1e-4},
+        {'params': model_ungsl.parameters(), 'lr': 5e-4},
+        {'params': model_cls.parameters(), 'lr': 1e-3, 'weight_decay': 1e-4}
     ], weight_decay=1e-5)
 
     for epoch in range(1, 201):
         model_gsl.train()
         model_ungsl.train()
-        if epoch == 100:
-            model_cls.requires_grad_(True)
-            finetune_optim = torch.optim.AdamW([
-                {'params': model_gsl.parameters(), 'lr': 1e-4},
-                {'params': model_ungsl.parameters(), 'lr': 5e-4},
-                {'params': model_cls.parameters(), 'lr': 1e-4, 'weight_decay': 1e-4}
-            ], weight_decay=1e-5)
+        model_cls.requires_grad_(True)
         finetune_optim.zero_grad()
         S = model_gsl(x, adj_dense)
         with torch.no_grad():
             cls_out = model_cls(x, edge_index)
             confidence = compute_confidence(cls_out)
         S_hat = model_ungsl(S, confidence)
-        edge_index_finetune = torch.nonzero(S_hat > config['threshold']).t()
+        edge_index_finetune = get_edge_index_from_S(S_hat, config['top_p'])
         out = model_cls(x, edge_index_finetune).squeeze(-1)
         cls_loss = criterion(out, y)
-        reg_loss = torch.norm(S_hat, p=1)
-        reg_weight = config['reg_weight'] * (1 + epoch / 500)
-        total_loss = cls_loss + reg_weight * reg_loss
+        total_loss = cls_loss
         total_loss.backward()
         finetune_optim.step()
 
+    # 显存释放
     orig_idx = subgraph.orig_node_idx.clone()
-    del adj_dense, S, S_hat, edge_index_S, edge_index_finetune, subgraph
+    del adj_dense, S, S_hat, edge_index, subgraph
     torch.cuda.empty_cache()
     return model_gsl, model_cls, model_ungsl, orig_idx
 
